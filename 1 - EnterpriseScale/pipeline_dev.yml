@@ -1,0 +1,248 @@
+name: $(BuildDefinitionName)_$(date:yyyyMMdd)$(rev:.r)
+
+trigger:
+  batch: true
+  branches:
+    include:
+      - main
+
+variables:
+  - group: tf_state
+  - name: tf_version
+    value: 1.3.3
+  - name: tf_in_automation
+    value: true
+  - name: terraform_destroy
+    value: false
+  - name: serviceConnectionName
+    value: ''
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+  - stage: Build
+    jobs:
+      - job: Plan
+        workspace:
+          clean: all
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - task: replacetokens@3
+            displayName: 'Inject Secrets'
+            inputs:
+              targetFiles: |
+                **/backend.tkn => Terraform/backend.hcl
+                **/terraform.tkn => Terraform/terraform.tfvars
+              tokenPrefix: '__'
+              tokenSuffix: '__'
+
+          - task: TerraformInstaller@0
+            displayName: 'Terraform - Install'
+            inputs:
+              terraformVersion: $(tf_version)
+
+          - task: AzureCLI@1
+            displayName: Set Credentials
+            inputs:
+              azureSubscription: $(serviceConnectionName)
+              scriptType: 'bash'
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                echo "##vso[task.setvariable variable=clientId]$servicePrincipalId"
+                echo "##vso[task.setvariable variable=clientSecret]$servicePrincipalKey"
+                echo "##vso[task.setvariable variable=subscriptionId]$(az account show --query id | xargs)"
+                echo "##vso[task.setvariable variable=tenantId]$(az account show --query tenantId | xargs)"
+
+          - task: Bash@3
+            displayName: 'Terraform - Init'
+            inputs:
+              targetType: 'inline'
+              workingDirectory: $(System.DefaultWorkingDirectory)/Terraform/
+              script: |
+                terraform init --backend-config=backend.hcl -input=false
+                terraform validate
+            env:
+              ARM_CLIENT_ID: $(clientId)
+              ARM_CLIENT_SECRET: $(clientSecret)
+              ARM_SUBSCRIPTION_ID: $(subscriptionId)
+              ARM_TENANT_ID: $(tenantId)
+              TF_VAR_env: $(environment)
+              TF_VAR_dnsprefix: $(dnsprefix)
+
+          - task: Bash@3
+            condition: eq(variables.terraform_destroy, false)
+            displayName: 'Terraform - Plan'
+            inputs:
+              targetType: 'inline'
+              workingDirectory: $(System.DefaultWorkingDirectory)/Terraform/
+              script: |
+                terraform plan -out=tfplan -input=false
+            env:
+              ARM_CLIENT_ID: $(clientId)
+              ARM_CLIENT_SECRET: $(clientSecret)
+              ARM_SUBSCRIPTION_ID: $(subscriptionId)
+              ARM_TENANT_ID: $(tenantId)
+              TF_VAR_env: $(environment)
+              TF_VAR_dnsprefix: $(dnsprefix)
+
+          - task: Bash@3
+            condition: eq(variables.terraform_destroy, true)
+            displayName: 'Terraform - Plan Destroy'
+            inputs:
+              targetType: 'inline'
+              workingDirectory: $(System.DefaultWorkingDirectory)/Terraform/
+              script: |
+                terraform plan -destroy -input=false
+            env:
+              ARM_CLIENT_ID: $(clientId)
+              ARM_CLIENT_SECRET: $(clientSecret)
+              ARM_SUBSCRIPTION_ID: $(subscriptionId)
+              ARM_TENANT_ID: $(tenantId)
+              TF_VAR_env: $(environment)
+              TF_VAR_dnsprefix: $(dnsprefix)
+
+          - task: ArchiveFiles@2
+            displayName: 'Create Artifact'
+            inputs:
+              rootFolderOrFile: '$(Build.SourcesDirectory)'
+              includeRootFolder: false
+              archiveType: 'tar'
+              tarCompression: 'gz'
+              archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).tgz'
+              replaceExistingArchive: true
+
+          - task: PublishBuildArtifacts@1
+            name: 'push_artifact'
+            displayName: 'Publish Artifact'
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: 'drop'
+              publishLocation: 'Container'
+
+  - stage: Deploy
+    dependsOn: Build
+    condition: and(succeeded('Build'), eq(variables.terraform_destroy, false))
+    jobs:
+      - deployment: DeployDev
+        timeoutInMinutes: 0
+        displayName: 'Dev Environment Deployment'
+        environment: 'Dev'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: none
+
+                - task: DownloadBuildArtifacts@0
+                  displayName: 'Download Plan Artifact'
+                  inputs:
+                    artifactName: 'drop'
+
+                - task: ExtractFiles@1
+                  displayName: 'Extract Plan Artifact'
+                  inputs:
+                    archiveFilePatterns: '$(System.ArtifactsDirectory)/drop/$(Build.BuildId).tgz'
+                    destinationFolder: '$(System.DefaultWorkingDirectory)/$(Build.BuildId)'
+                    cleanDestinationFolder: true
+                    overwriteExistingFiles: true
+
+                - task: TerraformInstaller@0
+                  displayName: 'Terraform - Install'
+                  inputs:
+                    terraformVersion: $(tf_version)
+
+                - task: AzureCLI@1
+                  displayName: Set Credentials
+                  inputs:
+                    azureSubscription: $(serviceConnectionName)
+                    scriptType: 'bash'
+                    scriptLocation: inlineScript
+                    addSpnToEnvironment: true
+                    inlineScript: |
+                      echo "##vso[task.setvariable variable=clientId]$servicePrincipalId"
+                      echo "##vso[task.setvariable variable=clientSecret]$servicePrincipalKey"
+                      echo "##vso[task.setvariable variable=subscriptionId]$(az account show --query id | xargs)"
+                      echo "##vso[task.setvariable variable=tenantId]$(az account show --query tenantId | xargs)"
+
+                - task: Bash@3
+                  displayName: 'Terraform - Apply'
+                  inputs:
+                    targetType: 'inline'
+                    workingDirectory: $(System.DefaultWorkingDirectory)/$(Build.BuildId)/Terraform/
+                    script: |
+                      terraform init -input=false
+                      terraform apply --auto-approve -input=false tfplan
+                  env:
+                    ARM_CLIENT_ID: $(clientId)
+                    ARM_CLIENT_SECRET: $(clientSecret)
+                    ARM_SUBSCRIPTION_ID: $(subscriptionId)
+                    ARM_TENANT_ID: $(tenantId)
+
+                - task: Bash@3
+                  displayName: 'Terraform - Output'
+                  inputs:
+                    targetType: 'inline'
+                    workingDirectory: $(System.DefaultWorkingDirectory)/$(Build.BuildId)/Terraform/
+                    script: |
+                      out=$(terraform output -json)
+
+
+  - stage: Destroy
+    condition: and(succeeded('Build'), eq(variables.terraform_destroy, true))
+    jobs:
+      - deployment: DestroyDev
+        displayName: 'Dev Environment Destroy'
+        environment: 'Dev'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: none
+
+                - task: DownloadBuildArtifacts@0
+                  displayName: 'Download Plan Artifact'
+                  inputs:
+                    artifactName: 'drop'
+
+                - task: ExtractFiles@1
+                  displayName: 'Extract Plan Artifact'
+                  inputs:
+                    archiveFilePatterns: '$(System.ArtifactsDirectory)/drop/$(Build.BuildId).tgz'
+                    destinationFolder: '$(System.DefaultWorkingDirectory)/$(Build.BuildId)'
+                    cleanDestinationFolder: true
+                    overwriteExistingFiles: true
+
+                - task: TerraformInstaller@0
+                  displayName: 'Terraform - Install'
+                  inputs:
+                    terraformVersion: $(tf_version)
+
+                - task: AzureCLI@1
+                  displayName: Set Credentials
+                  inputs:
+                    azureSubscription: $(serviceConnectionName)
+                    scriptType: 'bash'
+                    scriptLocation: inlineScript
+                    addSpnToEnvironment: true
+                    inlineScript: |
+                      echo "##vso[task.setvariable variable=clientId]$servicePrincipalId"
+                      echo "##vso[task.setvariable variable=clientSecret]$servicePrincipalKey"
+                      echo "##vso[task.setvariable variable=subscriptionId]$(az account show --query id | xargs)"
+                      echo "##vso[task.setvariable variable=tenantId]$(az account show --query tenantId | xargs)"
+
+                - task: Bash@3
+                  displayName: 'Terraform - Destroy'
+                  inputs:
+                    targetType: 'inline'
+                    workingDirectory: $(System.DefaultWorkingDirectory)/$(Build.BuildId)/Terraform/
+                    script: |
+                      terraform destroy --auto-approve -input=false
+                  env:
+                    ARM_CLIENT_ID: $(clientId)
+                    ARM_CLIENT_SECRET: $(clientSecret)
+                    ARM_SUBSCRIPTION_ID: $(subscriptionId)
+                    ARM_TENANT_ID: $(tenantId)

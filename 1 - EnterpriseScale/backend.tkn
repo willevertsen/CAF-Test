@@ -1,0 +1,4 @@
+storage_account_name = "__tfstate_sa__"
+container_name       = "__tfstate_cont__"
+key                  = "ap-azlz.terraform.tfstate"
+access_key           = "__tfstate_key__"

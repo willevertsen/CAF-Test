@@ -1,0 +1,4 @@
+storage_account_name = "axeleostfstate"
+container_name       = "tfstate"
+key                  = "aplz.terraform.tfstate"
+#access_key           = "__tfstate_key__"
